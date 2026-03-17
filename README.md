@@ -64,8 +64,7 @@ graph TD
     HA <--> ESP1
     HA <--> ESP2
     HA <--> Browser
-    Browser <-->|Browser Mode| HA
-    HA <-->|Browser Mode| Browser2
+    Browser <-->|Browser Mode| HA <-->|Browser Mode| Browser2
 ```
 
 ### Why This Project?
