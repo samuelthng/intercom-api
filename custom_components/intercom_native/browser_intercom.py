@@ -76,9 +76,14 @@ class BrowserEndpoint:
         """Push an event to this endpoint's browser client via the subscription."""
         try:
             self.connection.send_event(self.msg_id, {"event": event_type, **data})
-        except Exception:  # noqa: BLE001
-            # Connection may already be closed; ignore silently.
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Connection closure is expected; log unexpected errors for debugging.
+            _LOGGER.debug(
+                "Failed to send event '%s' to endpoint %s: %s",
+                event_type,
+                self.endpoint_id,
+                exc,
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize endpoint info for list responses."""
@@ -222,11 +227,11 @@ def websocket_browser_register(
     msg_id = msg["id"]
 
     # If the same endpoint_id is re-registering (e.g. page refresh within the
-    # same tab before the old connection has been fully torn down), remove the
-    # stale entry first.
-    old_ep = _browser_endpoints.pop(endpoint_id, None)
-    if old_ep:
-        _LOGGER.debug("Replacing stale endpoint registration: %s", endpoint_id)
+    # same tab before the old connection has been fully torn down), clean up the
+    # stale entry *including any active calls* so peers are properly notified.
+    if endpoint_id in _browser_endpoints:
+        _LOGGER.debug("Re-registering endpoint – cleaning up stale entry: %s", endpoint_id)
+        cleanup_endpoint(endpoint_id)
 
     endpoint = BrowserEndpoint(
         endpoint_id=endpoint_id,

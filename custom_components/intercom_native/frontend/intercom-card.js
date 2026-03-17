@@ -1323,7 +1323,7 @@ class IntercomCardEditor extends HTMLElement {
         .info { color: var(--secondary-text-color); font-size: 0.85em; margin-top: 8px; }
         .mode-selector { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
         .mode-btn {
-          flex: 1; min-width: 80px; padding: 12px; border: 2px solid var(--divider-color, #ccc);
+          flex: 1; min-width: 100px; padding: 12px; border: 2px solid var(--divider-color, #ccc);
           border-radius: 8px; background: var(--card-background-color, white);
           cursor: pointer; text-align: center; transition: all 0.2s;
         }
