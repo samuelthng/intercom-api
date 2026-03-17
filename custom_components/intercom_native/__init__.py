@@ -32,26 +32,35 @@ async def _async_setup_shared(hass: HomeAssistant, config: dict | None = None) -
         return  # Already set up (e.g. YAML + config entry both present)
 
     hass.data.setdefault(DOMAIN, {})
+    # Mark in-progress early to prevent concurrent double-setup, but reset on
+    # any failure so that HA retries are not permanently blocked.
     hass.data[DOMAIN]["initialized"] = True
 
-    # Register WebSocket API commands
-    async_register_websocket_api(hass)
+    try:
+        # Register WebSocket API commands
+        async_register_websocket_api(hass)
 
-    # Load sensor platform
-    hass.async_create_task(
-        async_load_platform(hass, Platform.SENSOR, DOMAIN, {}, config or {})
-    )
+        # Load sensor platform
+        hass.async_create_task(
+            async_load_platform(hass, Platform.SENSOR, DOMAIN, {}, config or {})
+        )
 
-    # Register frontend (Lovelace card auto-served from integration)
-    async def _register_frontend(_event: Event | None = None) -> None:
-        from .frontend import JSModuleRegistration
-        registration = JSModuleRegistration(hass)
-        await registration.async_register()
+        # Register frontend (Lovelace card auto-served from integration)
+        async def _register_frontend(_event: Event | None = None) -> None:
+            from .frontend import JSModuleRegistration
+            registration = JSModuleRegistration(hass)
+            await registration.async_register()
 
-    if hass.state == CoreState.running:
-        await _register_frontend(None)
-    else:
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_frontend)
+        if hass.state == CoreState.running:
+            await _register_frontend(None)
+        else:
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_frontend)
+
+    except Exception:
+        # Reset flag so the next setup attempt (e.g. HA retry) runs in full.
+        _LOGGER.exception("Setup failed; resetting initialized flag to allow retry")
+        hass.data[DOMAIN].pop("initialized", None)
+        raise
 
     _LOGGER.info("Intercom Native integration loaded (simple + full mode auto-bridge)")
 
@@ -70,4 +79,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    # Clear the initialized flag so that a subsequent reload re-registers all
+    # WebSocket commands and the Lovelace card resource from scratch.
+    hass.data.get(DOMAIN, {}).pop("initialized", None)
     return True
