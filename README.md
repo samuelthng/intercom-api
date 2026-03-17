@@ -27,6 +27,7 @@ From a simple ESPHome full-duplex doorbell to a PBX-like multi-device intercom, 
 - [Operating Modes](#operating-modes)
   - [Simple Mode](#simple-mode-browser--esp)
   - [Full Mode](#full-mode-esp--esp)
+  - [Browser Mode](#browser-mode-browser--browser)
 - [Configuration Reference](#configuration-reference)
 - [Entities and Controls](#entities-and-controls)
 - [Call Flow Diagrams](#call-flow-diagrams)
@@ -47,6 +48,7 @@ From a simple ESPHome full-duplex doorbell to a PBX-like multi-device intercom, 
 | 🔔 **Simple Doorbell** | 1 ESP + Browser | Ring notification, answer from phone/PC |
 | 🏠 **Home Intercom** | Multiple ESPs | Call between rooms (Kitchen ↔ Bedroom) |
 | 📞 **PBX-like System** | ESPs + Browser + HA | Full intercom network with Home Assistant as a participant |
+| 🌐 **Browser-to-Browser** | 2+ Browsers | Call between browser tabs or devices, no ESP required |
 | 🤖 **Voice Assistant + Intercom** | ESP (display optional) | Wake word, voice commands, weather, intercom, all on one device |
 
 **Home Assistant acts as the central hub** - it can receive calls (doorbell), make calls to ESPs, and relay calls between devices. All audio flows through HA, enabling remote access without complex NAT/firewall configuration.
@@ -57,10 +59,13 @@ graph TD
     ESP1[📻 ESP #1<br/>Kitchen]
     ESP2[📻 ESP #2<br/>Bedroom]
     Browser[🌐 Browser<br/>Phone]
+    Browser2[🌐 Browser<br/>Tablet]
 
     HA <--> ESP1
     HA <--> ESP2
     HA <--> Browser
+    Browser <-->|Browser Mode| HA
+    HA <-->|Browser Mode| Browser2
 ```
 
 ### Why This Project?
@@ -76,9 +81,10 @@ Along the way I discovered that ESPHome couldn't handle a codec and I2S componen
 ## Features
 
 - **Full-duplex audio** - Talk and listen simultaneously
-- **Two operating modes**:
+- **Three operating modes**:
   - **Simple**: Browser ↔ Home Assistant ↔ ESP
   - **Full**: ESP ↔ Home Assistant ↔ ESP (intercom between devices)
+  - **Browser**: Browser ↔ Home Assistant ↔ Browser (no ESP required)
 - **Echo Cancellation (AEC)** - Built-in acoustic echo cancellation using ESP-SR
   *(ES8311 digital feedback mode provides perfect sample-accurate echo cancellation)*
 - **Voice Assistant compatible** - Coexists with ESPHome Voice Assistant and Micro Wake Word
@@ -104,6 +110,7 @@ graph TB
             WS[WebSocket API<br/>/start /stop /audio]
             TCP[TCP Client<br/>Port 6054<br/>Async queue]
             Bridge[Auto-Bridge<br/>Full Mode<br/>ESP↔ESP relay]
+            BrowserRelay[Browser Relay<br/>Browser Mode<br/>Browser↔Browser]
         end
     end
 
@@ -111,11 +118,17 @@ graph TB
         Card[Lovelace Card<br/>AudioWorklet<br/>getUserMedia]
     end
 
+    subgraph Browser2[🌐 Browser #2]
+        Card2[Lovelace Card<br/>AudioWorklet<br/>getUserMedia]
+    end
+
     subgraph ESP[📻 ESP32]
         API[intercom_api<br/>FreeRTOS Tasks<br/>I2S mic/spk]
     end
 
     Card <-->|WebSocket<br/>JSON+Base64| WS
+    Card2 <-->|WebSocket<br/>JSON+Base64| BrowserRelay
+    Card <-->|WebSocket<br/>JSON+Base64| BrowserRelay
     API <-->|TCP :6054<br/>Binary PCM| TCP
 ```
 
@@ -399,6 +412,17 @@ name: Kitchen Intercom
 mode: full  # or 'simple'
 ```
 
+For browser-to-browser mode (no ESP needed):
+
+```yaml
+type: custom:intercom-card
+mode: browser
+name: Living Room
+endpoint_name: Living Room
+```
+
+The `endpoint_name` is the display name shown to other browser endpoints when they browse available contacts.
+
 The card automatically discovers ESPHome devices with the `intercom_api` component.
 
 The Lovelace card provides **full-duplex bidirectional audio** with the ESP device: you can talk and listen simultaneously through your browser or the Home Assistant Companion app. The card captures audio from your microphone via `getUserMedia()` and plays incoming audio from the ESP in real-time.
@@ -475,6 +499,58 @@ graph TB
 - Caller ID display
 - Ringing timeout with auto-decline
 - Bidirectional hangup propagation
+
+### Browser Mode (Browser ↔ Browser)
+
+Browser mode allows two (or more) browser tabs or devices to call each other directly through Home Assistant, **with no ESP hardware required**. HA acts as both the signaling server and the audio relay.
+
+```mermaid
+graph LR
+    B1[🌐 Browser #1] <-->|WebSocket| HA[🏠 HA<br/>Signaling + Relay]
+    HA <-->|WebSocket| B2[🌐 Browser #2]
+```
+
+Each browser card registers itself as a named endpoint. Endpoints discover each other in real time and can place one-to-one calls with full-duplex audio — all relayed through HA over the existing WebSocket connection. No TCP port forwarding, no WebRTC, no STUN/TURN required.
+
+**Call Flow (Browser #1 calls Browser #2):**
+1. Both browsers load the Lovelace card with `mode: browser`
+2. Each card registers as a named endpoint (e.g. "Living Room", "Bedroom")
+3. Browser #1 selects "Bedroom" from the endpoint list and clicks **Call**
+4. HA creates a call session and pushes an `incoming_call` event to Browser #2
+5. Browser #2 shows an incoming call with **Answer** / **Decline** buttons
+6. User clicks **Answer** → both sides start mic capture and audio playback
+7. HA relays audio chunks between the two browsers in real time
+8. Either side can hang up → the other side receives a `call_ended` event
+
+**Browser mode features:**
+- No ESP or TCP dependencies — works on any device with a browser
+- Endpoint list auto-updates when browsers connect or disconnect
+- Busy detection — callee is automatically marked busy during a call
+- Automatic cleanup on browser close or navigation
+- Stable per-tab endpoint ID (survives page refresh within the same tab)
+- Reuses the same AudioWorklet capture and scheduled playback as Simple mode
+
+**Use Browser mode when:**
+- You want intercom between phones, tablets, or PCs without any ESP hardware
+- You need a softphone-style interface within Home Assistant
+- You want to add browser endpoints alongside ESP devices in a mixed network
+
+**Lovelace card configuration:**
+
+```yaml
+type: custom:intercom-card
+mode: browser
+name: Living Room
+endpoint_name: Living Room
+```
+
+| Option | Description |
+|--------|-------------|
+| `mode` | Must be `browser` |
+| `name` | Card title shown in the UI |
+| `endpoint_name` | Display name advertised to other browser endpoints |
+
+> **Note**: Each browser tab generates its own stable endpoint ID (stored in `sessionStorage`). Opening the same URL in a new tab creates a second independent endpoint.
 
 ### ESP calling Home Assistant (Doorbell)
 
@@ -648,6 +724,42 @@ sequenceDiagram
     HA->>E2: STOP
     Note left of E1: State: Idle
     Note right of E2: State: Idle
+```
+
+### Browser Mode: Browser calls Browser
+
+```mermaid
+sequenceDiagram
+    participant B1 as 🌐 Browser #1 (Caller)
+    participant HA as 🏠 Home Assistant
+    participant B2 as 🌐 Browser #2 (Callee)
+
+    B1->>HA: WS: browser_register {endpoint_id, display_name}
+    B2->>HA: WS: browser_register {endpoint_id, display_name}
+    HA-->>B1: event: endpoint_list_updated
+    HA-->>B2: event: endpoint_list_updated
+
+    B1->>HA: WS: browser_call_start {caller_id, callee_id}
+    HA-->>B2: event: incoming_call {call_id, caller_display_name}
+    HA-->>B1: result: {success: true, call_id, state: "ringing"}
+    Note right of B2: Shows Answer/Decline UI
+
+    B2->>HA: WS: browser_call_answer {call_id, answering_endpoint_id}
+    HA-->>B1: event: call_answered {call_id, callee_display_name}
+    Note left of B1: Starts mic capture
+    Note right of B2: Starts mic capture
+
+    loop HA relays audio chunks
+        B1->>HA: WS: browser_audio {call_id, sender_id, audio (base64)}
+        HA-->>B2: event: audio {call_id, sender_id, audio}
+        B2->>HA: WS: browser_audio {call_id, sender_id, audio (base64)}
+        HA-->>B1: event: audio {call_id, sender_id, audio}
+    end
+
+    B1->>HA: WS: browser_call_hangup {call_id, endpoint_id}
+    HA-->>B2: event: call_ended {call_id, reason: "hangup"}
+    Note left of B1: State: Idle
+    Note right of B2: State: Idle
 ```
 
 ---
@@ -973,6 +1085,23 @@ Every setup is different: room acoustics, mic sensitivity, speaker placement, co
 2. Verify `sensor.intercom_active_devices` exists in HA
 3. Check ESP subscribes to this sensor via `text_sensor: platform: homeassistant`
 4. Devices must be online and connected to HA
+
+### Browser mode: no endpoints visible / "Failed to register endpoint"
+
+1. Verify the integration is installed and `intercom_native:` is in your configuration
+2. Restart Home Assistant after install — the browser WebSocket commands register on startup
+3. Check the browser console for `Failed to register browser endpoint` errors
+4. Ensure HTTPS is used (required for `getUserMedia`; `localhost` is exempt)
+5. Try reloading the dashboard page; the card re-registers on every page load
+6. If two cards share the same `endpoint_name` in the same browser tab, they will share the same endpoint ID — give each card a unique `endpoint_name`
+
+### Browser mode: call connects but no audio
+
+1. Check browser microphone permissions (site must have mic access)
+2. Verify HTTPS — `getUserMedia` is blocked on non-secure origins
+3. Open both browser consoles and look for AudioContext or worklet errors
+4. Try Chrome (best AudioWorklet support); Firefox and Safari may behave differently
+5. Check Home Assistant WebSocket connection health in browser dev-tools (Network tab)
 
 ---
 
