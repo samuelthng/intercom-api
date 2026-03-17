@@ -581,6 +581,10 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_decline)
     websocket_api.async_register_command(hass, websocket_subscribe_audio)
 
+    # Browser-to-browser intercom commands
+    from .browser_intercom import async_register_browser_websocket_api
+    async_register_browser_websocket_api(hass)
+
 
 @websocket_api.websocket_command(
     {

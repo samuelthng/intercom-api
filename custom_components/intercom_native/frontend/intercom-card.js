@@ -9,6 +9,11 @@
  * - Calling    -> Show "Calling [dest]..." + Hangup
  * - Ringing    -> Show "Incoming [caller]" + Answer/Decline
  * - Streaming  -> Show "In Call [peer]" + Hangup
+ *
+ * Browser mode (mode: "browser"):
+ * - Registers this browser tab as a named endpoint with HA
+ * - Lists other online browser endpoints
+ * - Supports one-to-one calling with full-duplex audio relayed through HA
  */
 
 const INTERCOM_CARD_VERSION = "2.1.4";
@@ -54,6 +59,18 @@ class IntercomCard extends HTMLElement {
 
     // Persistent error message (survives _render() DOM rebuild)
     this._errorMsg = "";
+
+    // -----------------------------------------------------------------------
+    // Browser-to-browser mode state
+    // -----------------------------------------------------------------------
+    this._browserEndpointId = null;       // stable per-tab ID (sessionStorage)
+    this._browserSubscription = null;     // subscribeMessage unsubscribe fn
+    this._browserEndpoints = [];          // online endpoints from server
+    this._browserCallState = "idle";      // idle|calling|ringing|active
+    this._activeCallId = null;            // current call_id
+    this._browserPeerName = "";           // display name of the remote peer
+    this._browserRegistered = false;      // true after register completes
+    this._browserSelectedEndpoint = null; // endpoint_id selected to call
   }
 
   setConfig(config) {
@@ -64,6 +81,14 @@ class IntercomCard extends HTMLElement {
   set hass(hass) {
     const oldHass = this._hass;
     this._hass = hass;
+
+    // Browser mode: register endpoint once when hass is first set
+    if (hass && this._isBrowserMode()) {
+      if (!this._browserRegistered) {
+        this._registerBrowserEndpoint();
+      }
+      return; // Browser mode renders via event callbacks only
+    }
 
     // Load devices for full mode
     if (hass && this._isFullMode() && this._availableDevices.length === 0) {
@@ -128,6 +153,10 @@ class IntercomCard extends HTMLElement {
     return this.config?.mode === "full";
   }
 
+  _isBrowserMode() {
+    return this.config?.mode === "browser";
+  }
+
   _getConfigDeviceId() {
     return this.config?.entity_id || this.config?.device_id;
   }
@@ -154,6 +183,435 @@ class IntercomCard extends HTMLElement {
     const entity = this._hass.states[this._destinationEntityId];
     return entity?.state || "Home Assistant";
   }
+
+  // =========================================================================
+  // Browser-to-browser mode methods
+  // =========================================================================
+
+  /** Return or generate a stable endpoint ID for this browser tab. */
+  _getBrowserEndpointId() {
+    if (this._browserEndpointId) return this._browserEndpointId;
+    const epName = this.config?.endpoint_name || "Browser";
+    const slug = epName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+    const storageKey = `intercom_native_ep_${slug}`;
+    let id = sessionStorage.getItem(storageKey);
+    if (!id) {
+      id = `browser-${slug}-${Math.random().toString(36).slice(2, 9)}`;
+      sessionStorage.setItem(storageKey, id);
+    }
+    this._browserEndpointId = id;
+    return id;
+  }
+
+  /** Register this card as a browser endpoint (subscription command). */
+  async _registerBrowserEndpoint() {
+    if (!this._hass || this._browserRegistered) return;
+    this._browserRegistered = true; // Prevent duplicate calls
+
+    const endpointId = this._getBrowserEndpointId();
+    const displayName = this.config?.endpoint_name || "Browser";
+
+    try {
+      this._browserSubscription = await this._hass.connection.subscribeMessage(
+        (msg) => this._handleBrowserEvent(msg),
+        {
+          type: "intercom_native/browser_register",
+          endpoint_id: endpointId,
+          display_name: displayName,
+        }
+      );
+    } catch (err) {
+      console.error("Failed to register browser endpoint:", err);
+      this._browserRegistered = false;
+      this._showError("Failed to register endpoint");
+      this._render();
+    }
+  }
+
+  /** Handle events pushed from the server via the browser_register subscription. */
+  _handleBrowserEvent(msg) {
+    if (!msg || !msg.event) return;
+
+    switch (msg.event) {
+      case "endpoint_list_updated":
+        // Refresh the list of available endpoints (exclude self)
+        this._browserEndpoints = (msg.endpoints || []).filter(
+          (ep) => ep.endpoint_id !== this._getBrowserEndpointId()
+        );
+        this._render();
+        break;
+
+      case "incoming_call":
+        // Another browser is calling us
+        this._browserCallState = "ringing";
+        this._activeCallId = msg.call_id;
+        this._browserPeerName = msg.caller_display_name || msg.caller_endpoint_id;
+        this._errorMsg = "";
+        this._render();
+        break;
+
+      case "call_answered":
+        // Our outgoing call was answered
+        this._browserCallState = "active";
+        this._browserPeerName = msg.callee_display_name || msg.callee_endpoint_id;
+        this._startBrowserAudio();
+        this._render();
+        break;
+
+      case "call_declined":
+        // Our outgoing call was declined
+        this._browserCallState = "idle";
+        this._activeCallId = null;
+        this._browserPeerName = "";
+        this._showError("Call declined");
+        this._render();
+        break;
+
+      case "call_ended":
+        // Call was ended by the other side or due to disconnect
+        if (this._browserCallState !== "idle") {
+          const wasActive = this._browserCallState === "active";
+          this._browserCallState = "idle";
+          this._activeCallId = null;
+          this._browserPeerName = "";
+          if (wasActive) this._cleanupBrowserAudio();
+          this._errorMsg = msg.reason === "endpoint_disconnected" ? "Peer disconnected" : "";
+          this._render();
+        }
+        break;
+
+      case "audio":
+        // Incoming audio chunk from the peer
+        if (this._browserCallState === "active" && this._playbackContext) {
+          this._handleBrowserAudio(msg.audio);
+        }
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  /** Start mic capture and playback for a browser call. */
+  async _startBrowserAudio() {
+    try {
+      await this._setupMicAndSpeaker();
+      // Override the worklet audio handler to route via browser_audio command
+      if (this._workletNode) {
+        this._workletNode.port.onmessage = (e) => {
+          if (e.data.type === "audio") this._sendBrowserAudio(new Int16Array(e.data.buffer));
+        };
+      }
+      this._audioStreaming = true;
+      this._chunksSent = 0;
+      this._chunksReceived = 0;
+    } catch (err) {
+      console.error("Failed to start browser audio:", err);
+      this._showError("Microphone access denied");
+      // Hang up since we can't do audio
+      if (this._activeCallId) {
+        this._hangupBrowserCall().catch(() => {});
+      }
+    }
+  }
+
+  /** Send an audio chunk to the peer via browser_audio command. */
+  _sendBrowserAudio(int16Array) {
+    if (!this._activeCallId || !this._hass) return;
+    const bytes = new Uint8Array(int16Array.buffer);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 0x8000, bytes.length)));
+    }
+    this._hass.connection.sendMessage({
+      type: "intercom_native/browser_audio",
+      call_id: this._activeCallId,
+      sender_endpoint_id: this._getBrowserEndpointId(),
+      audio: btoa(binary),
+    });
+    this._chunksSent++;
+    if (this._chunksSent % 25 === 0) this._updateStats();
+  }
+
+  /** Play an incoming audio chunk from the peer. */
+  _handleBrowserAudio(audiob64) {
+    if (!audiob64 || !this._playbackContext) return;
+    this._chunksReceived++;
+    if (this._chunksReceived % 50 === 0) this._updateStats();
+    try {
+      const binary = atob(audiob64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const int16 = new Int16Array(bytes.buffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+      this._playScheduled(float32);
+    } catch (_err) { /* ignore decode errors */ }
+  }
+
+  /** Stop mic/speaker for a browser call. */
+  async _cleanupBrowserAudio() {
+    this._audioStreaming = false;
+    if (this._unsubscribeAudio) { this._unsubscribeAudio(); this._unsubscribeAudio = null; }
+    if (this._mediaStream) { this._mediaStream.getTracks().forEach(t => t.stop()); this._mediaStream = null; }
+    if (this._workletNode) { this._workletNode.disconnect(); this._workletNode = null; }
+    if (this._source) { this._source.disconnect(); this._source = null; }
+    if (this._audioContext) { await this._audioContext.close().catch(() => {}); this._audioContext = null; }
+    if (this._playbackContext) { await this._playbackContext.close().catch(() => {}); this._playbackContext = null; }
+    this._gainNode = null;
+    this._nextPlayTime = 0;
+  }
+
+  /** Initiate a call to the selected browser endpoint. */
+  async _startBrowserCall() {
+    if (!this._browserSelectedEndpoint || !this._hass) return;
+    this._errorMsg = "";
+    try {
+      const result = await this._hass.connection.sendMessagePromise({
+        type: "intercom_native/browser_call_start",
+        caller_endpoint_id: this._getBrowserEndpointId(),
+        callee_endpoint_id: this._browserSelectedEndpoint,
+      });
+      if (result?.success) {
+        this._browserCallState = "calling";
+        this._activeCallId = result.call_id;
+        const peer = this._browserEndpoints.find(ep => ep.endpoint_id === this._browserSelectedEndpoint);
+        this._browserPeerName = peer?.display_name || this._browserSelectedEndpoint;
+        this._render();
+      } else if (result?.reason === "busy") {
+        this._showError("Endpoint is busy");
+        this._render();
+      } else {
+        this._showError("Call failed");
+        this._render();
+      }
+    } catch (err) {
+      this._showError(err.message || "Call failed");
+      this._render();
+    }
+  }
+
+  /** Answer an incoming browser call. */
+  async _answerBrowserCall() {
+    if (!this._activeCallId || !this._hass) return;
+    try {
+      const result = await this._hass.connection.sendMessagePromise({
+        type: "intercom_native/browser_call_answer",
+        call_id: this._activeCallId,
+        answering_endpoint_id: this._getBrowserEndpointId(),
+      });
+      if (result?.success) {
+        this._browserCallState = "active";
+        await this._startBrowserAudio();
+        this._render();
+      } else {
+        this._showError("Answer failed");
+        this._render();
+      }
+    } catch (err) {
+      this._showError(err.message || "Answer failed");
+      this._render();
+    }
+  }
+
+  /** Decline an incoming browser call. */
+  async _declineBrowserCall() {
+    if (!this._activeCallId || !this._hass) return;
+    try {
+      await this._hass.connection.sendMessagePromise({
+        type: "intercom_native/browser_call_decline",
+        call_id: this._activeCallId,
+        declining_endpoint_id: this._getBrowserEndpointId(),
+      });
+    } catch (_err) { /* ignore */ }
+    this._browserCallState = "idle";
+    this._activeCallId = null;
+    this._browserPeerName = "";
+    this._render();
+  }
+
+  /** Hang up an active or ringing browser call. */
+  async _hangupBrowserCall() {
+    if (!this._activeCallId || !this._hass) return;
+    const callId = this._activeCallId;
+    const wasActive = this._browserCallState === "active";
+    this._browserCallState = "idle";
+    this._activeCallId = null;
+    this._browserPeerName = "";
+    if (wasActive) this._cleanupBrowserAudio();
+    this._render();
+    try {
+      await this._hass.connection.sendMessagePromise({
+        type: "intercom_native/browser_call_hangup",
+        call_id: callId,
+        endpoint_id: this._getBrowserEndpointId(),
+      });
+    } catch (_err) { /* ignore */ }
+  }
+
+  /** Render the browser-mode card UI. */
+  _renderBrowserMode() {
+    const name = this.config?.name || "Intercom";
+    const registered = this._browserRegistered;
+    const epName = this.config?.endpoint_name || "Browser";
+    const callState = this._browserCallState;
+    const peerName = this._browserPeerName;
+    const endpoints = this._browserEndpoints;
+
+    let statusText = "";
+    let statusClass = "disconnected";
+    let showCall = false;
+    let showHangup = false;
+    let showAnswer = false;
+
+    switch (callState) {
+      case "idle":
+        statusText = registered ? "Ready" : "Connecting...";
+        statusClass = registered ? "disconnected" : "transitioning";
+        showCall = registered && this._browserSelectedEndpoint != null;
+        break;
+      case "calling":
+        statusText = `Calling ${peerName}...`;
+        statusClass = "transitioning";
+        showHangup = true;
+        break;
+      case "ringing":
+        statusText = `Incoming: ${peerName}`;
+        statusClass = "ringing";
+        showAnswer = true;
+        break;
+      case "active":
+        statusText = `In Call: ${peerName}`;
+        statusClass = "connected";
+        showHangup = true;
+        break;
+    }
+
+    const endpointOptions = endpoints.map(ep => `
+      <div class="endpoint-item ${this._browserSelectedEndpoint === ep.endpoint_id ? 'selected' : ''}"
+           data-id="${ep.endpoint_id}">
+        <span class="ep-name">${ep.display_name}</span>
+        <span class="ep-state ${ep.state}">${ep.state}</span>
+      </div>
+    `).join("") || '<div class="no-endpoints">No other endpoints online</div>';
+
+    this.shadowRoot.innerHTML = `
+      <style>
+        :host { display: block; }
+        .card {
+          background: var(--ha-card-background, var(--card-background-color, white));
+          border-radius: var(--ha-card-border-radius, 12px);
+          box-shadow: var(--ha-card-box-shadow, 0 2px 6px rgba(0,0,0,0.1));
+          padding: 16px;
+        }
+        .header { font-size: 1.2em; font-weight: 500; margin-bottom: 4px; color: var(--primary-text-color); }
+        .mode-badge {
+          display: inline-block; font-size: 0.7em; padding: 2px 6px;
+          border-radius: 4px; margin-left: 8px; vertical-align: middle;
+          background: #9c27b0; color: white;
+        }
+        .ep-label { font-size: 0.8em; color: var(--secondary-text-color); margin-bottom: 12px; }
+        .endpoints-label { font-size: 0.8em; font-weight: 500; color: var(--secondary-text-color); margin-bottom: 6px; }
+        .endpoints-list { border: 1px solid var(--divider-color, #ccc); border-radius: 8px; overflow: hidden; margin-bottom: 12px; max-height: 160px; overflow-y: auto; }
+        .endpoint-item {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--divider-color, #eee);
+          transition: background 0.15s;
+        }
+        .endpoint-item:last-child { border-bottom: none; }
+        .endpoint-item:hover { background: var(--secondary-background-color, #f5f5f5); }
+        .endpoint-item.selected { background: var(--primary-color, #03a9f4); color: white; }
+        .endpoint-item.selected .ep-state { color: rgba(255,255,255,0.8); }
+        .ep-name { font-weight: 500; }
+        .ep-state { font-size: 0.75em; color: var(--secondary-text-color); }
+        .ep-state.busy { color: #f44336; }
+        .no-endpoints { padding: 16px; text-align: center; color: var(--secondary-text-color); font-style: italic; font-size: 0.9em; }
+        .button-container { display: flex; justify-content: center; gap: 20px; margin-bottom: 12px; }
+        .intercom-button {
+          width: 90px; height: 90px; border-radius: 50%; border: none; cursor: pointer;
+          font-size: 0.95em; font-weight: bold; transition: all 0.2s ease;
+          display: flex; align-items: center; justify-content: center;
+        }
+        .intercom-button.call { background: #4caf50; color: white; }
+        .intercom-button.answer { background: #4caf50; color: white; animation: ring-pulse 1s infinite; }
+        .intercom-button.decline { background: #f44336; color: white; animation: ring-pulse 1s infinite; }
+        .intercom-button.hangup { background: #f44336; color: white; }
+        .intercom-button:disabled { opacity: 0.5; cursor: not-allowed; animation: none; }
+        @keyframes ring-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
+        .status { text-align: center; color: var(--secondary-text-color); font-size: 0.9em; }
+        .status-indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+        .status-indicator.connected { background: #4caf50; }
+        .status-indicator.disconnected { background: #9e9e9e; }
+        .status-indicator.transitioning { background: #ff9800; animation: blink 0.5s infinite; }
+        .status-indicator.ringing { background: #ff9800; animation: blink 0.5s infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        .stats { font-size: 0.75em; color: #666; margin-top: 8px; text-align: center; }
+        .error { color: #f44336; font-size: 0.85em; text-align: center; margin-top: 8px; }
+        .version { font-size: 0.65em; color: #999; text-align: right; margin-top: 8px; }
+      </style>
+      <div class="card">
+        <div class="header">
+          ${name}
+          <span class="mode-badge">Browser</span>
+        </div>
+        <div class="ep-label">Registered as: <strong>${epName}</strong></div>
+
+        ${callState === "idle" ? `
+        <div class="endpoints-label">Available Endpoints</div>
+        <div class="endpoints-list" id="endpoints-list">
+          ${endpointOptions}
+        </div>
+        ` : ""}
+
+        <div class="button-container">
+          ${showAnswer ? `
+            <button class="intercom-button answer" id="answer-btn">Answer</button>
+            <button class="intercom-button decline" id="decline-btn">Decline</button>
+          ` : showHangup ? `
+            <button class="intercom-button hangup" id="hangup-btn">Hangup</button>
+          ` : showCall ? `
+            <button class="intercom-button call" id="call-btn">Call</button>
+          ` : `
+            <button class="intercom-button" disabled>...</button>
+          `}
+        </div>
+
+        <div class="status">
+          <span class="status-indicator ${statusClass}"></span>
+          ${statusText}
+        </div>
+        <div class="stats" id="stats">${this._audioStreaming ? `Sent: ${this._chunksSent} | Recv: ${this._chunksReceived}` : 'Browser ↔ Browser'}</div>
+        <div class="error" id="err">${this._errorMsg}</div>
+        <div class="version">v${INTERCOM_CARD_VERSION}</div>
+      </div>
+    `;
+
+    // Attach endpoint selection
+    const list = this.shadowRoot.getElementById("endpoints-list");
+    if (list) {
+      list.querySelectorAll(".endpoint-item").forEach(item => {
+        item.onclick = () => {
+          this._browserSelectedEndpoint = item.dataset.id;
+          this._render();
+        };
+      });
+    }
+
+    // Attach call controls
+    const callBtn = this.shadowRoot.getElementById("call-btn");
+    const hangupBtn = this.shadowRoot.getElementById("hangup-btn");
+    const answerBtn = this.shadowRoot.getElementById("answer-btn");
+    const declineBtn = this.shadowRoot.getElementById("decline-btn");
+
+    if (callBtn) callBtn.onclick = () => this._startBrowserCall();
+    if (hangupBtn) hangupBtn.onclick = () => this._hangupBrowserCall();
+    if (answerBtn) answerBtn.onclick = () => this._answerBrowserCall();
+    if (declineBtn) declineBtn.onclick = () => this._declineBrowserCall();
+  }
+
+  // =========================================================================
+  // End of browser-to-browser mode methods
+  // =========================================================================
 
   async _findEntityIds() {
     if (!this._hass) return;
@@ -216,6 +674,13 @@ class IntercomCard extends HTMLElement {
 
   _render() {
     const name = this.config?.name || "Intercom";
+
+    // Browser mode: separate rendering path
+    if (this._isBrowserMode()) {
+      this._renderBrowserMode();
+      return;
+    }
+
     const deviceId = this._getConfigDeviceId();
 
     if (!deviceId) {
@@ -783,6 +1248,12 @@ class IntercomCard extends HTMLElement {
   }
 
   disconnectedCallback() {
+    // Browser mode: unsubscribe from endpoint events (triggers server-side cleanup)
+    if (this._browserSubscription) {
+      this._browserSubscription();
+      this._browserSubscription = null;
+    }
+    this._cleanupBrowserAudio();
     this._cleanup();
   }
 
@@ -850,9 +1321,9 @@ class IntercomCardEditor extends HTMLElement {
           color: var(--primary-text-color); font-size: 1em; box-sizing: border-box;
         }
         .info { color: var(--secondary-text-color); font-size: 0.85em; margin-top: 8px; }
-        .mode-selector { display: flex; gap: 8px; margin-top: 8px; }
+        .mode-selector { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
         .mode-btn {
-          flex: 1; padding: 12px; border: 2px solid var(--divider-color, #ccc);
+          flex: 1; min-width: 100px; padding: 12px; border: 2px solid var(--divider-color, #ccc);
           border-radius: 8px; background: var(--card-background-color, white);
           cursor: pointer; text-align: center; transition: all 0.2s;
         }
@@ -865,6 +1336,7 @@ class IntercomCardEditor extends HTMLElement {
         .mode-info p { margin: 0; color: var(--secondary-text-color); font-size: 0.9em; }
       </style>
       <div style="padding: 16px;">
+        ${currentMode !== 'browser' ? `
         <div class="form-group">
           <label>Intercom Device</label>
           <select id="entity-select">
@@ -873,10 +1345,18 @@ class IntercomCardEditor extends HTMLElement {
           </select>
           <div class="info">${this._devicesLoaded ? (this._devices.length === 0 ? 'No devices found' : 'Select device') : 'Loading...'}</div>
         </div>
+        ` : ''}
         <div class="form-group">
           <label>Card Name (optional)</label>
           <input type="text" id="name-input" value="${this._config.name || ''}" placeholder="Intercom">
         </div>
+        ${currentMode === 'browser' ? `
+        <div class="form-group">
+          <label>Endpoint Name</label>
+          <input type="text" id="endpoint-name-input" value="${this._config.endpoint_name || ''}" placeholder="e.g. Living Room">
+          <div class="info">Human-readable name shown to other browser endpoints.</div>
+        </div>
+        ` : ''}
         <div class="form-group">
           <label>Mode</label>
           <div class="mode-selector">
@@ -888,24 +1368,35 @@ class IntercomCardEditor extends HTMLElement {
               <div class="mode-title">Full</div>
               <div class="mode-desc">ESP ↔ ESP</div>
             </div>
+            <div class="mode-btn ${currentMode === 'browser' ? 'selected' : ''}" id="mode-browser">
+              <div class="mode-title">Browser</div>
+              <div class="mode-desc">Browser ↔ Browser</div>
+            </div>
           </div>
         </div>
         <div class="mode-info">
           ${currentMode === 'simple' ? `
             <h4>Simple Mode</h4>
             <p>Browser audio ↔ ESP device</p>
-          ` : `
+          ` : currentMode === 'full' ? `
             <h4>Full Mode</h4>
             <p>ESP ↔ ESP bridged through Home Assistant</p>
+          ` : `
+            <h4>Browser Mode</h4>
+            <p>Browser ↔ Browser via Home Assistant (no ESP required)</p>
           `}
         </div>
       </div>
     `;
 
-    this.querySelector('#entity-select').onchange = (e) => this._valueChanged('entity_id', e.target.value);
+    const entitySelect = this.querySelector('#entity-select');
+    if (entitySelect) entitySelect.onchange = (e) => this._valueChanged('entity_id', e.target.value);
     this.querySelector('#name-input').onchange = (e) => this._valueChanged('name', e.target.value);
+    const epInput = this.querySelector('#endpoint-name-input');
+    if (epInput) epInput.onchange = (e) => this._valueChanged('endpoint_name', e.target.value);
     this.querySelector('#mode-simple').onclick = () => this._valueChanged('mode', 'simple');
     this.querySelector('#mode-full').onclick = () => this._valueChanged('mode', 'full');
+    this.querySelector('#mode-browser').onclick = () => this._valueChanged('mode', 'browser');
   }
 
   _valueChanged(key, value) {
@@ -923,6 +1414,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "intercom-card",
   name: "Intercom Card",
-  description: "ESP intercom control - mirrors ESP state (Simple and Full modes)",
+  description: "ESP intercom control - Simple, Full (ESP-ESP), and Browser (browser-to-browser) modes",
   preview: true,
 });
